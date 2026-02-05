@@ -4,43 +4,32 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function toTitleCase(sign) {
-  if (!sign || typeof sign !== "string") return "";
-  return sign.charAt(0).toUpperCase() + sign.slice(1).toLowerCase();
+// ---------- helpers ----------
+function toTitleCase(s) {
+  if (!s || typeof s !== "string") return "";
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
-async function fetchJson(url, opts = {}) {
+async function fetchText(url, opts = {}) {
   const res = await fetch(url, opts);
   const text = await res.text();
-
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch (_) {
-    // ignore
-  }
-
-  if (!res.ok) {
-    const msg =
-      (json && (json.error || json.message)) ||
-      text ||
-      `Request failed (${res.status})`;
-    const err = new Error(msg);
-    err.status = res.status;
-    err.raw = json || text;
-    throw err;
-  }
-
-  return json;
+  return { res, text };
 }
 
+function basicAuthHeader(userId, apiKey) {
+  return (
+    "Basic " +
+    Buffer.from(`${userId}:${apiKey}`).toString("base64")
+  );
+}
+
+// ---------- handler ----------
 exports.handler = async (event) => {
   try {
-    // CORS preflight
+    // CORS
     if (event.httpMethod === "OPTIONS") {
       return { statusCode: 204, headers: corsHeaders, body: "" };
     }
-
     if (event.httpMethod !== "POST") {
       return {
         statusCode: 405,
@@ -49,211 +38,176 @@ exports.handler = async (event) => {
       };
     }
 
-    // Env vars
-    const ASTROAPI_KEY = process.env.ASTROAPI_KEY;
-    const KIT_API_KEY = process.env.KIT_API_KEY;
-    const KIT_TAG_MAP_JSON = process.env.KIT_TAG_MAP_JSON;
-    const BDC_TIMEZONE_KEY = process.env.BDC_TIMEZONE_KEY;
+    // ENV VARS
+    const {
+      ASTROLOGY_API_USER_ID,
+      ASTROLOGY_API_KEY,
+      BDC_TIMEZONE_KEY,
+      KIT_API_KEY,
+      KIT_TAG_MAP_JSON,
+    } = process.env;
 
-    if (!ASTROAPI_KEY)
-      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing ASTROAPI_KEY env var" }) };
-    if (!KIT_API_KEY)
-      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing KIT_API_KEY env var" }) };
-    if (!KIT_TAG_MAP_JSON)
-      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing KIT_TAG_MAP_JSON env var" }) };
-    if (!BDC_TIMEZONE_KEY)
-      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing BDC_TIMEZONE_KEY env var" }) };
+    if (!ASTROLOGY_API_USER_ID) throw new Error("Missing ASTROLOGY_API_USER_ID");
+    if (!ASTROLOGY_API_KEY) throw new Error("Missing ASTROLOGY_API_KEY");
+    if (!BDC_TIMEZONE_KEY) throw new Error("Missing BDC_TIMEZONE_KEY");
+    if (!KIT_API_KEY) throw new Error("Missing KIT_API_KEY");
+    if (!KIT_TAG_MAP_JSON) throw new Error("Missing KIT_TAG_MAP_JSON");
 
-    let tagMap;
-    try {
-      tagMap = JSON.parse(KIT_TAG_MAP_JSON);
-    } catch {
-      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "KIT_TAG_MAP_JSON is not valid JSON" }) };
-    }
+    const tagMap = JSON.parse(KIT_TAG_MAP_JSON);
 
-    // Parse request body (timezone NOT required)
+    // BODY
     const { firstName, email, dob, tob, birthplace } = JSON.parse(event.body || "{}");
-
     if (!email || !dob || !tob || !birthplace) {
-      return {
-        statusCode: 400,
-        headers: corsHeaders,
-        body: JSON.stringify({
-          error: "Missing required fields",
-          details: { email: !!email, dob: !!dob, tob: !!tob, birthplace: !!birthplace },
-        }),
-      };
+      throw new Error("Missing required fields");
     }
 
-    // 1) Forward geocode (birthplace -> lat/lon) using Nominatim
-    // Nominatim requires a real User-Agent identifying your application.  [oai_citation:1‡operations.osmfoundation.org](https://operations.osmfoundation.org/policies/nominatim/?utm_source=chatgpt.com)
-    const nominatimUrl =
-      `https://nominatim.openstreetmap.org/search?` +
-      `q=${encodeURIComponent(birthplace)}` +
-      `&format=json&limit=1&addressdetails=0`;
+    // Parse date/time
+    const [year, month, day] = dob.split("-").map(Number);
+    const [hour, min] = tob.split(":").map(Number);
 
-    let nominatim;
-    try {
-      nominatim = await fetchJson(nominatimUrl, {
-        method: "GET",
-        headers: {
-          // Replace with your domain/app name (important for Nominatim policy)
-          "User-Agent": "SophieMaxwell-AstrologyChartLeadMagnet/1.0 (iceandthestars.com)",
-          "Accept": "application/json",
-        },
-      });
-    } catch (e) {
-      throw new Error(`Nominatim geocode: ${e.message}`);
-    }
+    // ---------- 1) GEOCODE (Nominatim) ----------
+    const geoUrl =
+      `https://nominatim.openstreetmap.org/search` +
+      `?q=${encodeURIComponent(birthplace)}` +
+      `&format=json&limit=1`;
 
-    const first = Array.isArray(nominatim) ? nominatim[0] : null;
-    const latitude = first?.lat ? Number(first.lat) : null;
-    const longitude = first?.lon ? Number(first.lon) : null;
+    const { res: geoRes, text: geoText } = await fetchText(geoUrl, {
+      headers: {
+        "User-Agent": "SophieMaxwell-Astrology/1.0 (iceandthestars.com)",
+      },
+    });
 
-    if (!latitude || !longitude) {
-      return {
-        statusCode: 400,
-        headers: corsHeaders,
-        body: JSON.stringify({
-          error: "Could not find that birthplace. Try 'City, Country' (e.g., Melbourne, Australia).",
-        }),
-      };
-    }
+    if (!geoRes.ok) throw new Error("Geocoding failed");
 
-    // 2) Timezone by lat/lng (BigDataCloud) -> IANA timezone
-    // Endpoint expects latitude/longitude and key.  [oai_citation:2‡BigDataCloud](https://www.bigdatacloud.com/reverse-geocoding?utm_source=chatgpt.com)
+    const geo = JSON.parse(geoText)[0];
+    if (!geo) throw new Error("Birthplace not found");
+
+    const lat = Number(geo.lat);
+    const lon = Number(geo.lon);
+
+    // ---------- 2) TIMEZONE (BigDataCloud) ----------
     const tzUrl =
-      `https://api-bdc.net/data/timezone-by-location?latitude=${encodeURIComponent(latitude)}` +
-      `&longitude=${encodeURIComponent(longitude)}` +
-      `&key=${encodeURIComponent(BDC_TIMEZONE_KEY)}`;
+      `https://api-bdc.net/data/timezone-by-location` +
+      `?latitude=${lat}&longitude=${lon}&key=${BDC_TIMEZONE_KEY}`;
 
-    let tz;
-    try {
-      tz = await fetchJson(tzUrl, { method: "GET" });
-    } catch (e) {
-      throw new Error(`BigDataCloud timezone: ${e.message}`);
-    }
+    const { res: tzRes, text: tzText } = await fetchText(tzUrl);
+    if (!tzRes.ok) throw new Error("Timezone lookup failed");
 
-    const timezone = tz?.ianaTimeId;
-    if (!timezone) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Could not resolve timezone from location." }),
-      };
-    }
+    const tz = JSON.parse(tzText);
+    const timeZoneId = tz.ianaTimeId;
+    if (!timeZoneId) throw new Error("Timezone not resolved");
 
-    // 3) AstroAPI natal chart (Placidus)
-    const datetime = `${dob}T${tob}:00`;
+    // ---------- 3) UTC OFFSET AT BIRTH ----------
+    const utcGuess = Math.floor(Date.UTC(year, month - 1, day, hour, min) / 1000);
 
-    let natal;
-    try {
-      natal = await fetchJson("https://api.astroapi.cloud/api/calc/natal", {
+    const tzInfoUrl =
+      `https://api-bdc.net/data/timezone-info` +
+      `?timeZoneId=${encodeURIComponent(timeZoneId)}` +
+      `&utcReference=${utcGuess}` +
+      `&key=${BDC_TIMEZONE_KEY}`;
+
+    const { res: tzInfoRes, text: tzInfoText } = await fetchText(tzInfoUrl);
+    if (!tzInfoRes.ok) throw new Error("Timezone offset failed");
+
+    const offsetSeconds = JSON.parse(tzInfoText).utcOffsetSeconds;
+    const tzone = offsetSeconds / 3600;
+
+    // ---------- 4) ASTROLOGYAPI (WESTERN / PLACIDUS) ----------
+    const auth = basicAuthHeader(
+      ASTROLOGY_API_USER_ID,
+      ASTROLOGY_API_KEY
+    );
+
+    const astrologyRes = await fetch(
+      "https://json.astrologyapi.com/v1/western_chart_data",
+      {
         method: "POST",
         headers: {
-          "X-Api-Key": ASTROAPI_KEY,
+          Authorization: auth,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          datetime,
-          latitude,
-          longitude,
-          timezone,
-          houseSystem: "placidus",
+          day,
+          month,
+          year,
+          hour,
+          min,
+          lat,
+          lon,
+          tzone,
+          house_type: "placidus",
         }),
-      });
-    } catch (e) {
-      throw new Error(`AstroAPI natal: ${e.message}`);
+      }
+    );
+
+    const astrologyText = await astrologyRes.text();
+    if (!astrologyRes.ok) {
+      throw new Error(`AstrologyAPI error: ${astrologyText}`);
     }
 
-    const attrs = natal?.data?.attributes || {};
-    const planets = attrs?.planets || {};
-    const houses = attrs?.houses || {};
-    const aspects = attrs?.aspects || [];
+    const natal = JSON.parse(astrologyText);
 
-    const sun = toTitleCase(planets?.sun?.sign);
-    const moon = toTitleCase(planets?.moon?.sign);
-    const rising = toTitleCase(houses?.["1"]?.sign);
+    // ---------- 5) EXTRACT BIG 3 ----------
+    const sun = toTitleCase(natal.planets?.Sun?.sign);
+    const moon = toTitleCase(natal.planets?.Moon?.sign);
+    const rising = toTitleCase(natal.houses?.["1"]?.sign);
 
     if (!sun || !moon || !rising) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Chart calculated but could not extract Sun/Moon/Rising." }),
-      };
+      throw new Error("Could not extract Sun / Moon / Rising");
     }
 
-    // 4) Kit: create subscriber
-    let sub;
-    try {
-      sub = await fetchJson("https://api.kit.com/v4/subscribers", {
-        method: "POST",
-        headers: {
-          "X-Kit-Api-Key": KIT_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          first_name: firstName || "",
-          email_address: email,
-          state: "active",
-        }),
-      });
-    } catch (e) {
-      throw new Error(`Kit create subscriber: ${e.message}`);
-    }
+    // ---------- 6) KIT SUBSCRIBE ----------
+    const kitRes = await fetch("https://api.kit.com/v4/subscribers", {
+      method: "POST",
+      headers: {
+        "X-Kit-Api-Key": KIT_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email_address: email,
+        first_name: firstName || "",
+        state: "active",
+      }),
+    });
 
-    const subscriberId = sub?.subscriber?.id;
-    if (!subscriberId) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Kit subscriber created but no subscriber ID returned." }),
-      };
-    }
+    const kitText = await kitRes.text();
+    if (!kitRes.ok) throw new Error(`Kit error: ${kitText}`);
 
-    // 5) Tag subscriber (Sun/Moon/Rising)
+    const subscriberId = JSON.parse(kitText).subscriber.id;
+
+    // ---------- 7) TAG ----------
     for (const key of [`SUN_${sun}`, `MOON_${moon}`, `RISING_${rising}`]) {
       const tagId = tagMap[key];
       if (!tagId) continue;
 
-      try {
-        await fetchJson(`https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`, {
+      await fetch(
+        `https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`,
+        {
           method: "POST",
           headers: {
             "X-Kit-Api-Key": KIT_API_KEY,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({}),
-        });
-      } catch (e) {
-        throw new Error(`Kit tag (${key}): ${e.message}`);
-      }
+          body: "{}",
+        }
+      );
     }
 
-    // 6) Return placements + full chart object for later use
+    // ---------- DONE ----------
     return {
       statusCode: 200,
       headers: corsHeaders,
       body: JSON.stringify({
         ok: true,
         placements: { sun, moon, rising },
-        chart: {
-          houseSystem: "placidus",
-          datetime,
-          timezone,
-          location: { query: birthplace, latitude, longitude },
-          planets,
-          houses,
-          aspects,
-        },
+        chart: natal,
       }),
     };
   } catch (err) {
-    // You’ll now see WHICH step failed (Nominatim / BigDataCloud / AstroAPI / Kit)
     return {
       statusCode: 500,
       headers: corsHeaders,
-      body: JSON.stringify({ error: err?.message || "Server error" }),
+      body: JSON.stringify({ error: err.message }),
     };
   }
 };
