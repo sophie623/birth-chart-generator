@@ -124,10 +124,50 @@ exports.handler = async (event) => {
     const auth = basicAuthHeader(ASTROLOGY_API_USER_ID, ASTROLOGY_API_KEY);
 
     // 1) GEO DETAILS (birthplace -> lat/lon)
-    const geo = await fetchJson("https://json.astrologyapi.com/v1/geo_details", {
-      headers: { Authorization: auth, "Accept-Language": "en" },
-      bodyObj: { place: String(birthplace), maxRows: 1 },
-    }); //  [oai_citation:2‡astrologyapi.com](https://astrologyapi.com/docs/api-ref/1/geo_details?utm_source=chatgpt.com)
+    async function lookupGeo(place) {
+  return fetchJson("https://json.astrologyapi.com/v1/geo_details", {
+    headers: { Authorization: auth, "Accept-Language": "en" },
+    bodyObj: { place, maxRows: 1 },
+  });
+}
+
+let geo;
+let geoPlaceTried = [];
+
+// 1) Try exactly as entered
+try {
+  geo = await lookupGeo(birthplace);
+  geoPlaceTried.push(birthplace);
+} catch {}
+
+// 2) Try city only (before comma)
+if (!geo?.geonames?.length) {
+  const cityOnly = birthplace.split(",")[0].trim();
+  try {
+    geo = await lookupGeo(cityOnly);
+    geoPlaceTried.push(cityOnly);
+  } catch {}
+}
+
+// 3) Try city + Australia
+if (!geo?.geonames?.length) {
+  const cityOnly = birthplace.split(",")[0].trim();
+  const ausFallback = `${cityOnly}, Australia`;
+  try {
+    geo = await lookupGeo(ausFallback);
+    geoPlaceTried.push(ausFallback);
+  } catch {}
+}
+
+const g0 = geo?.geonames?.[0];
+const lat = Number(g0?.latitude);
+const lon = Number(g0?.longitude);
+
+if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+  throw new Error(
+    `Birthplace not found. Tried: ${geoPlaceTried.join(" → ")}`
+  );
+} //  [oai_citation:2‡astrologyapi.com](https://astrologyapi.com/docs/api-ref/1/geo_details?utm_source=chatgpt.com)
 
     const g0 = geo?.geonames?.[0];
     const lat = Number(g0?.latitude);
