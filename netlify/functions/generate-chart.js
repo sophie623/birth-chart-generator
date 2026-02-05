@@ -12,11 +12,12 @@ function toTitleCase(sign) {
 async function fetchJson(url, opts = {}) {
   const res = await fetch(url, opts);
   const text = await res.text();
+
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
   } catch (_) {
-    // not JSON
+    // ignore
   }
 
   if (!res.ok) {
@@ -54,50 +55,24 @@ exports.handler = async (event) => {
     const KIT_TAG_MAP_JSON = process.env.KIT_TAG_MAP_JSON;
     const BDC_TIMEZONE_KEY = process.env.BDC_TIMEZONE_KEY;
 
-    if (!ASTROAPI_KEY) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Missing ASTROAPI_KEY env var" }),
-      };
-    }
-    if (!KIT_API_KEY) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Missing KIT_API_KEY env var" }),
-      };
-    }
-    if (!KIT_TAG_MAP_JSON) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Missing KIT_TAG_MAP_JSON env var" }),
-      };
-    }
-    if (!BDC_TIMEZONE_KEY) {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Missing BDC_TIMEZONE_KEY env var" }),
-      };
-    }
+    if (!ASTROAPI_KEY)
+      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing ASTROAPI_KEY env var" }) };
+    if (!KIT_API_KEY)
+      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing KIT_API_KEY env var" }) };
+    if (!KIT_TAG_MAP_JSON)
+      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing KIT_TAG_MAP_JSON env var" }) };
+    if (!BDC_TIMEZONE_KEY)
+      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Missing BDC_TIMEZONE_KEY env var" }) };
 
     let tagMap;
     try {
       tagMap = JSON.parse(KIT_TAG_MAP_JSON);
     } catch {
-      return {
-        statusCode: 500,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "KIT_TAG_MAP_JSON is not valid JSON" }),
-      };
+      return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "KIT_TAG_MAP_JSON is not valid JSON" }) };
     }
 
-    // Parse request body (timezone NOT required anymore)
-    const { firstName, email, dob, tob, birthplace } = JSON.parse(
-      event.body || "{}"
-    );
+    // Parse request body (timezone NOT required)
+    const { firstName, email, dob, tob, birthplace } = JSON.parse(event.body || "{}");
 
     if (!email || !dob || !tob || !birthplace) {
       return {
@@ -105,57 +80,57 @@ exports.handler = async (event) => {
         headers: corsHeaders,
         body: JSON.stringify({
           error: "Missing required fields",
-          details: {
-            email: !!email,
-            dob: !!dob,
-            tob: !!tob,
-            birthplace: !!birthplace,
-          },
+          details: { email: !!email, dob: !!dob, tob: !!tob, birthplace: !!birthplace },
         }),
       };
     }
 
-    // 1) AstroAPI geocode birthplace -> lat/lng
-    const geoUrl = `https://api.astroapi.cloud/api/geocoding/search?q=${encodeURIComponent(
-      birthplace
-    )}&limit=1`;
+    // 1) Forward geocode (birthplace -> lat/lon) using Nominatim
+    // Nominatim requires a real User-Agent identifying your application.  [oai_citation:1‡operations.osmfoundation.org](https://operations.osmfoundation.org/policies/nominatim/?utm_source=chatgpt.com)
+    const nominatimUrl =
+      `https://nominatim.openstreetmap.org/search?` +
+      `q=${encodeURIComponent(birthplace)}` +
+      `&format=json&limit=1&addressdetails=0`;
 
-    let geo;
+    let nominatim;
     try {
-      geo = await fetchJson(geoUrl, {
+      nominatim = await fetchJson(nominatimUrl, {
         method: "GET",
-        headers: { "X-Api-Key": ASTROAPI_KEY },
+        headers: {
+          // Replace with your domain/app name (important for Nominatim policy)
+          "User-Agent": "SophieMaxwell-AstrologyChartLeadMagnet/1.0 (iceandthestars.com)",
+          "Accept": "application/json",
+        },
       });
     } catch (e) {
-      // This is where you'd see "Unauthorized" if ASTROAPI_KEY is wrong
-      throw new Error(`AstroAPI geocode: ${e.message}`);
+      throw new Error(`Nominatim geocode: ${e.message}`);
     }
 
-    const place = geo?.data?.[0];
-    if (!place?.latitude || !place?.longitude) {
+    const first = Array.isArray(nominatim) ? nominatim[0] : null;
+    const latitude = first?.lat ? Number(first.lat) : null;
+    const longitude = first?.lon ? Number(first.lon) : null;
+
+    if (!latitude || !longitude) {
       return {
         statusCode: 400,
         headers: corsHeaders,
         body: JSON.stringify({
-          error:
-            "Could not find that birthplace. Try 'City, Country' (e.g., Melbourne, Australia).",
+          error: "Could not find that birthplace. Try 'City, Country' (e.g., Melbourne, Australia).",
         }),
       };
     }
 
-    // 2) BigDataCloud timezone lookup -> ianaTimeId
+    // 2) Timezone by lat/lng (BigDataCloud) -> IANA timezone
+    // Endpoint expects latitude/longitude and key.  [oai_citation:2‡BigDataCloud](https://www.bigdatacloud.com/reverse-geocoding?utm_source=chatgpt.com)
     const tzUrl =
-      `https://api-bdc.net/data/timezone-by-location?latitude=${encodeURIComponent(
-        place.latitude
-      )}` +
-      `&longitude=${encodeURIComponent(place.longitude)}` +
+      `https://api-bdc.net/data/timezone-by-location?latitude=${encodeURIComponent(latitude)}` +
+      `&longitude=${encodeURIComponent(longitude)}` +
       `&key=${encodeURIComponent(BDC_TIMEZONE_KEY)}`;
 
     let tz;
     try {
       tz = await fetchJson(tzUrl, { method: "GET" });
     } catch (e) {
-      // This is where you'd see "Unauthorized" if BDC_TIMEZONE_KEY is wrong
       throw new Error(`BigDataCloud timezone: ${e.message}`);
     }
 
@@ -164,10 +139,7 @@ exports.handler = async (event) => {
       return {
         statusCode: 500,
         headers: corsHeaders,
-        body: JSON.stringify({
-          error: "Could not resolve timezone from location.",
-          details: tz || null,
-        }),
+        body: JSON.stringify({ error: "Could not resolve timezone from location." }),
       };
     }
 
@@ -184,8 +156,8 @@ exports.handler = async (event) => {
         },
         body: JSON.stringify({
           datetime,
-          latitude: place.latitude,
-          longitude: place.longitude,
+          latitude,
+          longitude,
           timezone,
           houseSystem: "placidus",
         }),
@@ -207,14 +179,11 @@ exports.handler = async (event) => {
       return {
         statusCode: 500,
         headers: corsHeaders,
-        body: JSON.stringify({
-          error: "Chart calculated but could not extract Sun/Moon/Rising.",
-          details: { sun, moon, rising },
-        }),
+        body: JSON.stringify({ error: "Chart calculated but could not extract Sun/Moon/Rising." }),
       };
     }
 
-    // 4) Kit create subscriber
+    // 4) Kit: create subscriber
     let sub;
     try {
       sub = await fetchJson("https://api.kit.com/v4/subscribers", {
@@ -230,7 +199,6 @@ exports.handler = async (event) => {
         }),
       });
     } catch (e) {
-      // This is where you'd see "Unauthorized" if KIT_API_KEY is wrong / wrong key type
       throw new Error(`Kit create subscriber: ${e.message}`);
     }
 
@@ -239,38 +207,30 @@ exports.handler = async (event) => {
       return {
         statusCode: 500,
         headers: corsHeaders,
-        body: JSON.stringify({
-          error: "Kit subscriber created but no subscriber ID returned.",
-          details: sub || null,
-        }),
+        body: JSON.stringify({ error: "Kit subscriber created but no subscriber ID returned." }),
       };
     }
 
-    // 5) Apply tags (Sun/Moon/Rising)
-    const tagKeys = [`SUN_${sun}`, `MOON_${moon}`, `RISING_${rising}`];
-
-    for (const key of tagKeys) {
+    // 5) Tag subscriber (Sun/Moon/Rising)
+    for (const key of [`SUN_${sun}`, `MOON_${moon}`, `RISING_${rising}`]) {
       const tagId = tagMap[key];
-      if (!tagId) continue; // skip if mapping missing
+      if (!tagId) continue;
 
       try {
-        await fetchJson(
-          `https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`,
-          {
-            method: "POST",
-            headers: {
-              "X-Kit-Api-Key": KIT_API_KEY,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({}),
-          }
-        );
+        await fetchJson(`https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`, {
+          method: "POST",
+          headers: {
+            "X-Kit-Api-Key": KIT_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({}),
+        });
       } catch (e) {
         throw new Error(`Kit tag (${key}): ${e.message}`);
       }
     }
 
-    // 6) Return Big 3 + fuller chart object (for later use)
+    // 6) Return placements + full chart object for later use
     return {
       statusCode: 200,
       headers: corsHeaders,
@@ -281,12 +241,7 @@ exports.handler = async (event) => {
           houseSystem: "placidus",
           datetime,
           timezone,
-          location: {
-            query: birthplace,
-            displayName: place?.displayName || place?.name || birthplace,
-            latitude: place.latitude,
-            longitude: place.longitude,
-          },
+          location: { query: birthplace, latitude, longitude },
           planets,
           houses,
           aspects,
@@ -294,13 +249,11 @@ exports.handler = async (event) => {
       }),
     };
   } catch (err) {
-    // If we hit Unauthorized again, you will now see WHICH service caused it.
+    // You’ll now see WHICH step failed (Nominatim / BigDataCloud / AstroAPI / Kit)
     return {
       statusCode: 500,
       headers: corsHeaders,
-      body: JSON.stringify({
-        error: err?.message || "Server error",
-      }),
+      body: JSON.stringify({ error: err?.message || "Server error" }),
     };
   }
 };
