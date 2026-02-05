@@ -182,14 +182,18 @@ exports.handler = async (event) => {
       );
     }
 
-    return {
-      statusCode: 200,
-      headers: corsHeaders,
-      body: JSON.stringify({
-        ok: true,
-        placements: { sun, moon, rising },
-      }),
-    };
+return {
+  statusCode: 200,
+  headers: corsHeaders,
+  body: JSON.stringify({
+    ok: true,
+    placements: { sun, moon, rising },
+    chart: {
+      planets,
+      houseCusps
+    }
+  })
+};
   } catch (err) {
     return {
       statusCode: 500,
