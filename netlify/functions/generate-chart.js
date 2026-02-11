@@ -1,78 +1,275 @@
+// netlify/functions/generate-chart.js
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-function basicAuth(userId, apiKey) {
-  return "Basic " + Buffer.from(`${userId}:${apiKey}`).toString("base64");
+function titleCase(s) {
+  if (!s) return "";
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-async function astro(endpoint, auth, payload) {
-  const res = await fetch(`https://json.astrologyapi.com/v1/${endpoint}`, {
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function normalizeDeg(deg) {
+  let d = Number(deg);
+  while (d < 0) d += 360;
+  while (d >= 360) d -= 360;
+  return d;
+}
+
+function degreeToSign(deg) {
+  const signs = [
+    "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+    "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
+  ];
+  const d = normalizeDeg(deg);
+  const idx = Math.floor(d / 30);
+  return signs[idx];
+}
+
+/**
+ * Given house cusps in full zodiac degrees (0..360), determine house for a point degree.
+ * `houses` should be an array like [{house:1, degree:240.7}, ... {house:12, degree:216.5}]
+ */
+function getHouseFromCusps(pointDeg, houses) {
+  const p = normalizeDeg(pointDeg);
+  const cusps = houses
+    .map(h => ({ house: Number(h.house), degree: normalizeDeg(h.degree) }))
+    .sort((a, b) => a.house - b.house); // 1..12
+
+  // Build segments from cusp i to cusp i+1 (wrapping)
+  for (let i = 0; i < cusps.length; i++) {
+    const start = cusps[i].degree;
+    const end = cusps[(i + 1) % cusps.length].degree;
+    const houseNum = cusps[i].house;
+
+    // Normal segment (no wrap)
+    if (start <= end) {
+      if (p >= start && p < end) return houseNum;
+    } else {
+      // Wrap segment (e.g. 350 -> 20)
+      if (p >= start || p < end) return houseNum;
+    }
+  }
+
+  // Fallback
+  return 1;
+}
+
+/**
+ * AstrologyAPI Basic Auth:
+ * - Either provide ASTROAPI_USER_ID + ASTROAPI_KEY
+ * - Or provide ASTROAPI_KEY as "USERID:APIKEY"
+ */
+function getAstroAuth() {
+  const userId = process.env.ASTROAPI_USER_ID || "";
+  const apiKey = process.env.ASTROAPI_KEY || "";
+
+  if (userId && apiKey && !apiKey.includes(":")) {
+    const auth = Buffer.from(`${userId}:${apiKey}`).toString("base64");
+    return `Basic ${auth}`;
+  }
+
+  // If they stored as "userId:apiKey" in ASTROAPI_KEY:
+  if (apiKey.includes(":")) {
+    const auth = Buffer.from(apiKey).toString("base64");
+    return `Basic ${auth}`;
+  }
+
+  throw new Error("Missing AstrologyAPI credentials. Set ASTROAPI_USER_ID + ASTROAPI_KEY (or ASTROAPI_KEY as USERID:APIKEY).");
+}
+
+async function bdcGeocode(birthplace) {
+  const key = process.env.BDC_TIMEZONE_KEY;
+  if (!key) throw new Error("Missing BDC_TIMEZONE_KEY env var");
+
+  const url = `https://api-bdc.net/data/geocode-city?city=${encodeURIComponent(
+    birthplace
+  )}&key=${encodeURIComponent(key)}&localityLanguage=en`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BigDataCloud geocode failed (${res.status})`);
+  const data = await res.json();
+
+  // Heuristic: pick first result that has lat/lng
+  const loc = (data?.data && data.data[0]) || data;
+  const lat = loc?.latitude ?? loc?.lat;
+  const lon = loc?.longitude ?? loc?.lng ?? loc?.lon;
+
+  if (typeof lat !== "number" || typeof lon !== "number") {
+    throw new Error("Birthplace not found. Try 'City, Country' (e.g. Melbourne, Australia).");
+  }
+  return { lat, lon };
+}
+
+async function bdcTimezone(lat, lon) {
+  const key = process.env.BDC_TIMEZONE_KEY;
+  if (!key) throw new Error("Missing BDC_TIMEZONE_KEY env var");
+
+  const url = `https://api-bdc.net/data/timezone-by-location?latitude=${encodeURIComponent(
+    lat
+  )}&longitude=${encodeURIComponent(lon)}&key=${encodeURIComponent(key)}`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BigDataCloud timezone failed (${res.status})`);
+  const data = await res.json();
+
+  // BigDataCloud returns offset in seconds; we convert to hours decimal (e.g., 11.0)
+  const offsetSeconds =
+    data?.localTimeOffset?.currentLocalTimeOffset ??
+    data?.localTimeOffset?.localTimeOffset ??
+    data?.utcOffsetSeconds ??
+    null;
+
+  if (typeof offsetSeconds !== "number") {
+    throw new Error("Could not auto-derive timezone from birthplace.");
+  }
+
+  const tzone = offsetSeconds / 3600;
+  return { tzone, timezoneId: data?.ianaTimeId || data?.timeZoneId || "" };
+}
+
+async function astrologyApiWesternHoroscope({ day, month, year, hour, min, lat, lon, tzone }) {
+  const authHeader = getAstroAuth();
+
+  const endpoint = "https://json.astrologyapi.com/v1/western_horoscope";
+  const body = {
+    day,
+    month,
+    year,
+    hour,
+    min,
+    lat,
+    lon,
+    tzone,
+    house_type: "placidus",
+    // keep asteroids off for now; western_horoscope already includes Node/Chiron in planets list per docs
+    is_asteroids: false,
+  };
+
+  const res = await fetch(endpoint, {
     method: "POST",
     headers: {
-      Authorization: auth,
+      authorization: authHeader,
       "Content-Type": "application/json",
       "Accept-Language": "en",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 
-  const text = await res.text();
-
-  // Try to parse JSON if possible, but keep raw text for debugging
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
+  const json = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    // Include raw text so you see the real AstroAPI error in Netlify logs
-    throw new Error(`AstrologyAPI ${endpoint} error: ${text}`);
+    throw new Error(`AstrologyAPI error (${res.status}): ${JSON.stringify(json)}`);
+  }
+  if (json?.status === false) {
+    throw new Error(`AstrologyAPI error: ${JSON.stringify(json)}`);
   }
 
   return json;
 }
 
-function mmddyyyyFromIso(iso) {
-  // iso: YYYY-MM-DD  ->  MM-DD-YYYY
-  const [y, m, d] = String(iso).split("-");
-  if (!y || !m || !d) throw new Error("dob must be YYYY-MM-DD");
-  return `${m}-${d}-${y}`;
+function pickPlanet(planets, name) {
+  return planets.find(p => (p?.name || "").toLowerCase() === name.toLowerCase());
 }
 
-function parseDobTob(dob, tob) {
-  const [y, m, d] = String(dob).split("-").map(Number);
-  const [hh, mm] = String(tob).split(":").map(Number);
-  if (![y, m, d, hh, mm].every(Number.isFinite)) {
-    throw new Error("dob must be YYYY-MM-DD and tob must be HH:MM");
+function buildPlacements(westernHoroscopeJson) {
+  const planets = Array.isArray(westernHoroscopeJson?.planets)
+    ? westernHoroscopeJson.planets
+    : [];
+
+  const houses = Array.isArray(westernHoroscopeJson?.houses)
+    ? westernHoroscopeJson.houses
+    : [];
+
+  // Big 3
+  const sun = pickPlanet(planets, "Sun");
+  const moon = pickPlanet(planets, "Moon");
+
+  // Rising: AstrologyAPI may include Ascendant as planet OR provide `ascendant` numeric degree
+  const ascPlanet = pickPlanet(planets, "Ascendant");
+  const ascDeg =
+    ascPlanet?.full_degree ??
+    ascPlanet?.fullDegree ??
+    westernHoroscopeJson?.ascendant ??
+    null;
+
+  const risingSign = ascPlanet?.sign || (ascDeg != null ? degreeToSign(ascDeg) : "");
+  const risingHouse = 1; // by definition
+
+  // Node / Chiron
+  const node = pickPlanet(planets, "Node");     // North Node (per docs example)
+  const chiron = pickPlanet(planets, "Chiron");
+
+  // South Node = opposite point
+  const nodeFullDeg = node?.full_degree ?? node?.fullDegree ?? null;
+  const southDeg = nodeFullDeg != null ? normalizeDeg(Number(nodeFullDeg) + 180) : null;
+
+  const southNode = southDeg != null
+    ? {
+        name: "South Node",
+        full_degree: southDeg,
+        sign: degreeToSign(southDeg),
+        house: getHouseFromCusps(southDeg, houses),
+      }
+    : null;
+
+  // Main list order (you can change this anytime)
+  const order = [
+    "Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn","Uranus","Neptune","Pluto",
+    "Chiron","Node" // Node = North Node
+  ];
+
+  const list = [];
+
+  for (const nm of order) {
+    const p = pickPlanet(planets, nm);
+    if (!p) continue;
+
+    const sign = p.sign || "";
+    const house = Number(p.house) || (p.full_degree != null ? getHouseFromCusps(p.full_degree, houses) : null);
+
+    // Label Node nicely
+    const label =
+      nm === "Node" ? "North Node" : nm;
+
+    list.push({
+      name: label,
+      sign,
+      house,
+    });
   }
-  return { year: y, month: m, day: d, hour: hh, min: mm };
-}
 
-function titleCase(s) {
-  if (!s || typeof s !== "string") return "";
-  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
-}
+  if (southNode) {
+    list.push({
+      name: "South Node",
+      sign: southNode.sign,
+      house: southNode.house,
+    });
+  }
 
-function getPlanetSign(planets, name) {
-  const p = (planets || []).find((x) => x?.name === name);
-  return titleCase(p?.sign);
-}
-
-function getRisingSignFromHouses(houseCusps) {
-  const h1 = (houseCusps?.houses || []).find((h) => Number(h?.house) === 1);
-  return titleCase(h1?.sign);
+  return {
+    big3: {
+      sun: (sun?.sign || "").toLowerCase(),
+      moon: (moon?.sign || "").toLowerCase(),
+      rising: (risingSign || "").toLowerCase(),
+    },
+    list, // array of {name, sign, house}
+  };
 }
 
 exports.handler = async (event) => {
   try {
-    // CORS preflight
     if (event.httpMethod === "OPTIONS") {
       return { statusCode: 204, headers: corsHeaders, body: "" };
     }
-
     if (event.httpMethod !== "POST") {
       return {
         statusCode: 405,
@@ -81,172 +278,49 @@ exports.handler = async (event) => {
       };
     }
 
-    const ASTROLOGY_API_USER_ID = process.env.ASTROLOGY_API_USER_ID;
-    const ASTROLOGY_API_KEY = process.env.ASTROLOGY_API_KEY;
-    const KIT_API_KEY = process.env.KIT_API_KEY;
-    const KIT_TAG_MAP_JSON = process.env.KIT_TAG_MAP_JSON;
-
-    if (!ASTROLOGY_API_USER_ID) throw new Error("Missing ASTROLOGY_API_USER_ID env var");
-    if (!ASTROLOGY_API_KEY) throw new Error("Missing ASTROLOGY_API_KEY env var");
-    if (!KIT_API_KEY) throw new Error("Missing KIT_API_KEY env var");
-    if (!KIT_TAG_MAP_JSON) throw new Error("Missing KIT_TAG_MAP_JSON env var");
-
-    let tagMap;
-    try {
-      tagMap = JSON.parse(KIT_TAG_MAP_JSON);
-    } catch {
-      throw new Error("KIT_TAG_MAP_JSON is not valid JSON (check commas/quotes)");
-    }
-
-    const body = JSON.parse(event.body || "{}");
-    const { firstName, email, dob, tob, birthplace } = body;
+    const { firstName, email, dob, tob, birthplace } = JSON.parse(event.body || "{}");
 
     if (!email || !dob || !tob || !birthplace) {
       return {
         statusCode: 400,
         headers: corsHeaders,
-        body: JSON.stringify({ error: "Missing required fields (email, dob, tob, birthplace)" }),
+        body: JSON.stringify({ error: "Missing required fields" }),
       };
     }
 
-    const { year, month, day, hour, min } = parseDobTob(dob, tob);
-    const auth = basicAuth(ASTROLOGY_API_USER_ID, ASTROLOGY_API_KEY);
+    // Parse date + time
+    const [yearStr, monthStr, dayStr] = String(dob).split("-");
+    const [hourStr, minStr] = String(tob).split(":");
 
-    // ---- GEO DETAILS with fallbacks ----
-    const attempts = [
-      String(birthplace).trim(),
-      String(birthplace).split(",")[0].trim(),
-      `${String(birthplace).split(",")[0].trim()}, Australia`,
-    ];
+    const day = Number(dayStr);
+    const month = Number(monthStr);
+    const year = Number(yearStr);
+    const hour = Number(hourStr);
+    const min = Number(minStr);
 
-    let geo = null;
-    let lastGeoError = null;
+    // Geocode + timezone from BigDataCloud
+    const { lat, lon } = await bdcGeocode(birthplace);
+    const { tzone } = await bdcTimezone(lat, lon);
 
-    for (const place of attempts) {
-      try {
-        geo = await astro("geo_details", auth, { place, maxRows: 1 });
-        if (geo?.geonames?.length) break;
-      } catch (e) {
-        lastGeoError = e;
-      }
-    }
+    // AstrologyAPI western_horoscope (Placidus)
+    const wh = await astrologyApiWesternHoroscope({ day, month, year, hour, min, lat, lon, tzone });
 
-    const g0 = geo?.geonames?.[0];
-    const lat = Number(g0?.latitude);
-    const lon = Number(g0?.longitude);
+    const placements = buildPlacements(wh);
 
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-      // Surface what we tried so you can debug quickly
-      throw new Error(
-        `Birthplace not found. Tried: ${attempts.join(" → ")}${lastGeoError ? " | " + lastGeoError.message : ""}`
-      );
-    }
-
-    // ---- TIMEZONE WITH DST ----
-    const tz = await astro("timezone_with_dst", auth, {
-      latitude: lat,
-      longitude: lon,
-      date: mmddyyyyFromIso(dob),
-    });
-
-    const tzone = Number(tz?.timezone);
-    if (!Number.isFinite(tzone)) {
-      throw new Error("Timezone lookup failed (no timezone returned)");
-    }
-
-    // Base payload for chart endpoints
-    const base = {
-      day,
-      month,
-      year,
-      hour,
-      min,
-      lat,
-      lon,
-      tzone,
-      house_type: "placidus",
-    };
-
-    // ---- PLANETS + HOUSE CUSPS (authorised on Starter plan) ----
-    const planets = await astro("planets/tropical", auth, base);
-    const houseCusps = await astro("house_cusps/tropical", auth, base);
-
-    const sun = getPlanetSign(planets, "Sun");
-    const moon = getPlanetSign(planets, "Moon");
-    const rising = getRisingSignFromHouses(houseCusps);
-
-    if (!sun || !moon || !rising) {
-      throw new Error("Could not extract Sun/Moon/Rising from AstrologyAPI responses");
-    }
-
-    // ---- KIT subscribe ----
-    const kitSubRes = await fetch("https://api.kit.com/v4/subscribers", {
-      method: "POST",
-      headers: {
-        "X-Kit-Api-Key": KIT_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-      },
-      body: JSON.stringify({
-        email_address: email,
-        first_name: firstName || "",
-        state: "active",
-      }),
-    });
-
-    const kitText = await kitSubRes.text();
-    let kitJson = null;
-    try { kitJson = kitText ? JSON.parse(kitText) : null; } catch {}
-
-    if (!kitSubRes.ok) {
-      throw new Error(`Kit subscribe error: ${kitText}`);
-    }
-
-    const subscriberId = kitJson?.subscriber?.id;
-    if (!subscriberId) {
-      throw new Error(`Kit subscribe failed (no subscriber id). Response: ${kitText}`);
-    }
-
-    // ---- KIT tags ----
-    const tagKeys = [`SUN_${sun}`, `MOON_${moon}`, `RISING_${rising}`];
-
-    for (const key of tagKeys) {
-      const tagId = tagMap?.[key];
-      if (!tagId) continue;
-
-      const tagRes = await fetch(`https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`, {
-        method: "POST",
-        headers: { "X-Kit-Api-Key": KIT_API_KEY, "Accept": "application/json" },
-      });
-
-      if (!tagRes.ok) {
-        const tagText = await tagRes.text();
-        // Don’t hard-fail the entire request if tagging fails; just log details
-        console.warn(`Kit tag failed for ${key} (${tagId}): ${tagText}`);
-      }
-    }
-
-    // ✅ IMPORTANT: return chart data so Squarespace can list planet+house
+    // Return what Squarespace needs
     return {
       statusCode: 200,
-      headers: corsHeaders,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         ok: true,
-        placements: { sun, moon, rising },
-        chart: {
-          planets,
-          houseCusps,
-          meta: { house_type: "placidus", lat, lon, tzone },
-        },
+        placements,
       }),
     };
   } catch (err) {
     return {
       statusCode: 500,
       headers: corsHeaders,
-      body: JSON.stringify({
-        error: err?.message || "Unknown error",
-      }),
+      body: JSON.stringify({ error: err?.message || "Unknown error" }),
     };
   }
 };
