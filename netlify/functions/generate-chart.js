@@ -212,12 +212,16 @@ const [hour, min] = String(tob).split(":").map(Number);
     const planets=horoscope.planets||[];
     const houses=horoscope.houses||[];
 
-    const getPlanet=n=>planets.find(p=>p.name?.toLowerCase()===n.toLowerCase());
+    const getPlanet = name =>
+  planets.find(p =>
+    String(p.name || "").toLowerCase() === name.toLowerCase()
+  );
 
-    const sun=getPlanet("Sun");
-    const moon=getPlanet("Moon");
-    const node=getPlanet("Node");
-    const asc=getPlanet("Ascendant");
+   const sun = getPlanet("sun");
+const moon = getPlanet("moon");
+const node = getPlanet("node");
+const chiron = getPlanet("chiron");
+const ascendant = getPlanet("ascendant");
 
     const rising=asc?.sign || degreeToSign(horoscope.ascendant);
 
