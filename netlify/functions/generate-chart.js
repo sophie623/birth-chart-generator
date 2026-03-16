@@ -24,8 +24,14 @@ function degreeToSign(deg) {
   return signs[Math.floor(d / 30)];
 }
 
+function ordinal(n) {
+  const s = ["th","st","nd","rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 // ---------------- Geocoding ----------------
 
+// Forward geocode (City → lat/lon)
 async function forwardGeocode(birthplace) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(birthplace)}`;
 
@@ -40,7 +46,6 @@ async function forwardGeocode(birthplace) {
   }
 
   const data = await res.json();
-
   if (!Array.isArray(data) || !data.length) {
     throw new Error("Birthplace not found. Try 'City, Country' (e.g. Melbourne, Australia).");
   }
@@ -51,15 +56,12 @@ async function forwardGeocode(birthplace) {
   };
 }
 
+// Timezone from lat/lon
 async function getTimezone(lat, lon) {
   const key = process.env.BDC_TIMEZONE_KEY;
-
-  if (!key) {
-    throw new Error("Missing BDC_TIMEZONE_KEY env var");
-  }
+  if (!key) throw new Error("Missing BDC_TIMEZONE_KEY env var");
 
   const url = `https://api-bdc.net/data/timezone-by-location?latitude=${lat}&longitude=${lon}&key=${key}`;
-
   const res = await fetch(url);
 
   if (!res.ok) {
@@ -67,7 +69,6 @@ async function getTimezone(lat, lon) {
   }
 
   const data = await res.json();
-
   const offsetSeconds =
     data?.localTimeOffset?.currentLocalTimeOffset ??
     data?.utcOffsetSeconds;
@@ -90,7 +91,6 @@ function getAstroAuthHeader() {
   }
 
   const auth = Buffer.from(`${userId}:${apiKey}`).toString("base64");
-
   return `Basic ${auth}`;
 }
 
@@ -120,6 +120,7 @@ async function fetchWesternHoroscope(params) {
   return json;
 }
 
+// Determine house from cusp array
 function getHouseFromCusps(deg, houses) {
   const p = normalizeDeg(deg);
 
@@ -128,7 +129,6 @@ function getHouseFromCusps(deg, houses) {
     .sort((a, b) => a.house - b.house);
 
   for (let i = 0; i < cusps.length; i++) {
-
     const start = cusps[i].degree;
     const end = cusps[(i + 1) % cusps.length].degree;
     const houseNum = cusps[i].house;
@@ -138,92 +138,15 @@ function getHouseFromCusps(deg, houses) {
     } else {
       if (p >= start || p < end) return houseNum;
     }
-
   }
 
   return 1;
 }
 
-// ---------------- Kit helpers ----------------
-
-async function kitCreateOrUpdateSubscriber({ email, firstName }) {
-
-  const apiKey = process.env.KIT_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("Missing KIT_API_KEY env var");
-  }
-
-  const res = await fetch("https://api.kit.com/v4/subscribers", {
-
-    method: "POST",
-
-    headers: {
-      "X-Kit-Api-Key": apiKey,
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-    },
-
-    body: JSON.stringify({
-      email_address: email,
-      first_name: firstName || "",
-      state: "active",
-    }),
-
-  });
-
-  const text = await res.text();
-
-  let json = null;
-
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!res.ok) {
-    throw new Error(`Kit subscribe error: ${text}`);
-  }
-
-  const subscriberId = json?.subscriber?.id;
-
-  if (!subscriberId) {
-    throw new Error(`Kit subscribe failed (no subscriber id). Response: ${text}`);
-  }
-
-  return subscriberId;
-}
-
-async function kitTagSubscriber({ subscriberId, tagId }) {
-
-  const apiKey = process.env.KIT_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("Missing KIT_API_KEY env var");
-  }
-
-  await fetch(
-
-    `https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`,
-
-    {
-      method: "POST",
-      headers: {
-        "X-Kit-Api-Key": apiKey,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-      },
-      body: JSON.stringify({})
-    }
-
-  );
-}
-
 // ---------------- Main Handler ----------------
 
 exports.handler = async (event) => {
-
   try {
-
     if (event.httpMethod === "OPTIONS") {
       return { statusCode: 204, headers: corsHeaders, body: "" };
     }
@@ -232,20 +155,17 @@ exports.handler = async (event) => {
       JSON.parse(event.body || "{}");
 
     if (!email || !dob || !tob || !birthplace) {
-
       return {
         statusCode: 400,
         headers: corsHeaders,
         body: JSON.stringify({ error: "Missing required fields" }),
       };
-
     }
 
     const [year, month, day] = dob.split("-").map(Number);
     const [hour, min] = tob.split(":").map(Number);
 
     const { lat, lon } = await forwardGeocode(birthplace);
-
     const tzone = await getTimezone(lat, lon);
 
     const horoscope = await fetchWesternHoroscope({
@@ -267,27 +187,26 @@ exports.handler = async (event) => {
 
     const sun = getPlanet("Sun");
     const moon = getPlanet("Moon");
-    const node = getPlanet("Node");
+    const node = getPlanet("Node");   // North Node
+    const chiron = getPlanet("Chiron");
     const ascendant = getPlanet("Ascendant");
 
     const risingSign =
       ascendant?.sign ||
       degreeToSign(horoscope.ascendant);
 
+    // Calculate South Node (opposite of North Node)
     let southNode = null;
-
     if (node?.full_degree != null) {
-
       const southDeg = normalizeDeg(Number(node.full_degree) + 180);
-
       southNode = {
         name: "South Node",
         sign: degreeToSign(southDeg),
         house: getHouseFromCusps(southDeg, houses)
       };
-
     }
 
+    // Build full list
     const orderedNames = [
       "Sun","Moon","Mercury","Venus","Mars","Jupiter","Saturn",
       "Uranus","Neptune","Pluto","Chiron","Node"
@@ -296,9 +215,7 @@ exports.handler = async (event) => {
     const list = [];
 
     for (const name of orderedNames) {
-
       const p = getPlanet(name);
-
       if (!p) continue;
 
       const label = name === "Node" ? "North Node" : name;
@@ -308,42 +225,9 @@ exports.handler = async (event) => {
         sign: p.sign,
         house: p.house || getHouseFromCusps(p.full_degree, houses)
       });
-
     }
 
     if (southNode) list.push(southNode);
-
-    // ---------------- Kit Subscriber ----------------
-
-    const subscriberId = await kitCreateOrUpdateSubscriber({
-      email,
-      firstName,
-    });
-
-    let tagMap = {};
-
-    try {
-      tagMap = JSON.parse(process.env.KIT_TAG_MAP_JSON || "{}");
-    } catch {}
-
-    const sunKey = sun?.sign ? `SUN_${sun.sign}` : null;
-    const moonKey = moon?.sign ? `MOON_${moon.sign}` : null;
-    const risingKey = risingSign ? `RISING_${risingSign}` : null;
-
-    const tagKeys = [sunKey, moonKey, risingKey].filter(Boolean);
-
-    for (const key of tagKeys) {
-
-      const tagId = tagMap[key];
-
-      if (!tagId) continue;
-
-      await kitTagSubscriber({
-        subscriberId,
-        tagId
-      });
-
-    }
 
     return {
       statusCode: 200,
@@ -355,23 +239,16 @@ exports.handler = async (event) => {
             moon: moon?.sign?.toLowerCase(),
             rising: risingSign?.toLowerCase()
           },
-          list: list
+          list
         }
       }),
     };
 
-  }
-
-  catch (err) {
-
+  } catch (err) {
     return {
       statusCode: 500,
       headers: corsHeaders,
-      body: JSON.stringify({
-        error: err.message || "Unknown error"
-      }),
+      body: JSON.stringify({ error: err.message || "Unknown error" }),
     };
-
   }
-
 };
