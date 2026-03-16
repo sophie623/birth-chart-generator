@@ -24,11 +24,6 @@ function degreeToSign(deg) {
   return signs[Math.floor(d / 30)];
 }
 
-function ordinal(n) {
-  const s = ["th","st","nd","rd"], v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
-}
-
 // ---------------- Geocoding ----------------
 
 // Forward geocode (City → lat/lon)
@@ -143,12 +138,81 @@ function getHouseFromCusps(deg, houses) {
   return 1;
 }
 
+// ---------------- Kit helpers ----------------
+
+async function kitCreateOrUpdateSubscriber({ email, firstName }) {
+  const apiKey = process.env.KIT_API_KEY;
+  if (!apiKey) throw new Error("Missing KIT_API_KEY env var");
+
+  const res = await fetch("https://api.kit.com/v4/subscribers", {
+    method: "POST",
+    headers: {
+      "X-Kit-Api-Key": apiKey,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    },
+    body: JSON.stringify({
+      email_address: email,
+      first_name: firstName || "",
+      state: "active",
+    }),
+  });
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+
+  if (!res.ok) {
+    throw new Error(`Kit subscribe error: ${text}`);
+  }
+
+  const subscriberId = json?.subscriber?.id;
+  if (!subscriberId) {
+    throw new Error(`Kit subscribe failed (no subscriber id). Response: ${text}`);
+  }
+
+  return subscriberId;
+}
+
+async function kitTagSubscriber({ subscriberId, tagId, tagKey }) {
+  const apiKey = process.env.KIT_API_KEY;
+  if (!apiKey) throw new Error("Missing KIT_API_KEY env var");
+
+  const res = await fetch(
+    `https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`,
+    {
+      method: "POST",
+      headers: {
+        "X-Kit-Api-Key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({}),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.warn(`Kit tag failed for ${tagKey} (${tagId}): ${text}`);
+  }
+}
+
 // ---------------- Main Handler ----------------
 
 exports.handler = async (event) => {
   try {
     if (event.httpMethod === "OPTIONS") {
       return { statusCode: 204, headers: corsHeaders, body: "" };
+    }
+
+    if (event.httpMethod !== "POST") {
+      return {
+        statusCode: 405,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: "Method not allowed" }),
+      };
     }
 
     const { firstName, email, dob, tob, birthplace } =
@@ -188,7 +252,6 @@ exports.handler = async (event) => {
     const sun = getPlanet("Sun");
     const moon = getPlanet("Moon");
     const node = getPlanet("Node");   // North Node
-    const chiron = getPlanet("Chiron");
     const ascendant = getPlanet("Ascendant");
 
     const risingSign =
@@ -228,6 +291,39 @@ exports.handler = async (event) => {
     }
 
     if (southNode) list.push(southNode);
+
+    // ---------------- Kit subscribe + tag ----------------
+    const subscriberId = await kitCreateOrUpdateSubscriber({
+      email,
+      firstName,
+    });
+
+    let tagMap = {};
+    try {
+      tagMap = JSON.parse(process.env.KIT_TAG_MAP_JSON || "{}");
+    } catch {
+      console.warn("KIT_TAG_MAP_JSON is not valid JSON");
+    }
+
+    const sunKey = sun?.sign ? `SUN_${sun.sign}` : null;
+    const moonKey = moon?.sign ? `MOON_${moon.sign}` : null;
+    const risingKey = risingSign ? `RISING_${risingSign}` : null;
+
+    const tagKeys = [sunKey, moonKey, risingKey].filter(Boolean);
+
+    for (const key of tagKeys) {
+      const tagId = tagMap[key];
+      if (!tagId) {
+        console.warn(`No tag ID found for ${key}`);
+        continue;
+      }
+
+      await kitTagSubscriber({
+        subscriberId,
+        tagId,
+        tagKey: key,
+      });
+    }
 
     return {
       statusCode: 200,
