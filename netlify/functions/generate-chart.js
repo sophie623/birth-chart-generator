@@ -19,6 +19,42 @@ function degreeToSign(deg) {
   return signs[Math.floor(normalizeDeg(deg) / 30)];
 }
 
+function mmddyyyy(isoDate) {
+  const [y, m, d] = String(isoDate).split("-");
+  return `${m}-${d}-${y}`;
+}
+
+function getAstroAuthHeader() {
+  const userId = process.env.ASTROLOGY_API_USER_ID;
+  const apiKey = process.env.ASTROLOGY_API_KEY;
+
+  if (!userId || !apiKey) {
+    throw new Error("Missing ASTROLOGY_API_USER_ID or ASTROLOGY_API_KEY env var");
+  }
+
+  return `Basic ${Buffer.from(`${userId}:${apiKey}`).toString("base64")}`;
+}
+
+async function astroPost(endpoint, payload) {
+  const res = await fetch(`https://json.astrologyapi.com/v1/${endpoint}`, {
+    method: "POST",
+    headers: {
+      authorization: getAstroAuthHeader(),
+      "Content-Type": "application/json",
+      "Accept-Language": "en"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const json = await res.json().catch(() => ({}));
+
+  if (!res.ok || json?.status === false) {
+    throw new Error(`AstrologyAPI ${endpoint} error: ${JSON.stringify(json)}`);
+  }
+
+  return json;
+}
+
 async function forwardGeocode(birthplace) {
   const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(birthplace)}`;
 
@@ -44,63 +80,20 @@ async function forwardGeocode(birthplace) {
   };
 }
 
-async function getTimezone(lat, lon) {
-  const key = process.env.BDC_TIMEZONE_KEY;
-  if (!key) throw new Error("Missing BDC_TIMEZONE_KEY env var");
-
-  const url = `https://api-bdc.net/data/timezone-by-location?latitude=${lat}&longitude=${lon}&key=${key}`;
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Timezone lookup failed (${res.status})`);
-  }
-
-  const data = await res.json();
-
-  const offsetSeconds =
-    data?.localTimeOffset?.currentLocalTimeOffset ??
-    data?.utcOffsetSeconds;
-
-  if (typeof offsetSeconds !== "number") {
-    throw new Error("Could not derive timezone.");
-  }
-
-  return offsetSeconds / 3600;
-}
-
-function getAstroAuthHeader() {
-  const userId = process.env.ASTROLOGY_API_USER_ID;
-  const apiKey = process.env.ASTROLOGY_API_KEY;
-
-  if (!userId || !apiKey) {
-    throw new Error("Missing ASTROLOGY_API_USER_ID or ASTROLOGY_API_KEY env var");
-  }
-
-  return `Basic ${Buffer.from(`${userId}:${apiKey}`).toString("base64")}`;
-}
-
-async function fetchWesternHoroscope(params) {
-  const res = await fetch("https://json.astrologyapi.com/v1/western_horoscope", {
-    method: "POST",
-    headers: {
-      authorization: getAstroAuthHeader(),
-      "Content-Type": "application/json",
-      "Accept-Language": "en"
-    },
-    body: JSON.stringify({
-      ...params,
-      house_type: "placidus",
-      is_asteroids: false
-    })
+async function getBirthTimezone(lat, lon, dob) {
+  const json = await astroPost("timezone_with_dst", {
+    latitude: lat,
+    longitude: lon,
+    date: mmddyyyy(dob)
   });
 
-  const json = await res.json().catch(() => ({}));
+  const tzone = Number(json?.timezone);
 
-  if (!res.ok || json?.status === false) {
-    throw new Error(`AstrologyAPI error: ${JSON.stringify(json)}`);
+  if (!Number.isFinite(tzone)) {
+    throw new Error("Could not derive birth-date timezone.");
   }
 
-  return json;
+  return tzone;
 }
 
 function getHouseFromCusps(deg, houses) {
@@ -136,10 +129,13 @@ function findPlanet(planets, name) {
 
 async function createKitSubscriber(email, firstName) {
   try {
+    const apiKey = process.env.KIT_API_KEY;
+    if (!apiKey) return null;
+
     const res = await fetch("https://api.kit.com/v4/subscribers", {
       method: "POST",
       headers: {
-        "X-Kit-Api-Key": process.env.KIT_API_KEY,
+        "X-Kit-Api-Key": apiKey,
         "Content-Type": "application/json",
         "Accept": "application/json"
       },
@@ -160,10 +156,13 @@ async function createKitSubscriber(email, firstName) {
 
 async function tagKitSubscriber(subscriberId, tagId) {
   try {
+    const apiKey = process.env.KIT_API_KEY;
+    if (!apiKey || !subscriberId || !tagId) return;
+
     await fetch(`https://api.kit.com/v4/tags/${tagId}/subscribers/${subscriberId}`, {
       method: "POST",
       headers: {
-        "X-Kit-Api-Key": process.env.KIT_API_KEY,
+        "X-Kit-Api-Key": apiKey,
         "Content-Type": "application/json",
         "Accept": "application/json"
       },
@@ -207,9 +206,9 @@ exports.handler = async (event) => {
     const [hour, min] = String(tob).split(":").map(Number);
 
     const { lat, lon } = await forwardGeocode(birthplace);
-    const tzone = await getTimezone(lat, lon);
+    const tzone = await getBirthTimezone(lat, lon, dob);
 
-    const horoscope = await fetchWesternHoroscope({
+    const horoscope = await astroPost("western_horoscope", {
       day,
       month,
       year,
@@ -217,25 +216,29 @@ exports.handler = async (event) => {
       min,
       lat,
       lon,
-      tzone
+      tzone,
+      house_type: "placidus",
+      is_asteroids: false
     });
 
-    const planets = horoscope.planets || [];
-    const houses = horoscope.houses || [];
+    const planets = horoscope?.planets || [];
+    const houses = horoscope?.houses || [];
 
     const sun = findPlanet(planets, "Sun") || findPlanet(planets, "sun");
     const moon = findPlanet(planets, "Moon") || findPlanet(planets, "moon");
     const node = findPlanet(planets, "Node") || findPlanet(planets, "node");
+    const chiron = findPlanet(planets, "Chiron") || findPlanet(planets, "chiron");
     const ascendant = findPlanet(planets, "Ascendant") || findPlanet(planets, "ascendant");
 
     const risingSign =
       ascendant?.sign ||
-      degreeToSign(horoscope.ascendant);
+      degreeToSign(horoscope?.ascendant);
 
     let southNode = null;
+    const nodeFullDegree = Number(node?.full_degree ?? node?.fullDegree ?? node?.degree);
 
-    if (node?.full_degree != null) {
-      const southDeg = normalizeDeg(Number(node.full_degree) + 180);
+    if (Number.isFinite(nodeFullDegree)) {
+      const southDeg = normalizeDeg(nodeFullDegree + 180);
       southNode = {
         name: "South Node",
         sign: degreeToSign(southDeg),
@@ -259,11 +262,12 @@ exports.handler = async (event) => {
       if (!p) continue;
 
       const label = name === "Node" ? "North Node" : name;
+      const fullDeg = Number(p?.full_degree ?? p?.fullDegree ?? p?.degree);
 
       list.push({
         name: label,
-        sign: p.sign,
-        house: p.house || getHouseFromCusps(p.full_degree, houses)
+        sign: p.sign || "",
+        house: Number(p.house) || (Number.isFinite(fullDeg) ? getHouseFromCusps(fullDeg, houses) : "")
       });
     }
 
@@ -301,7 +305,7 @@ exports.handler = async (event) => {
             moon: moon?.sign?.toLowerCase() || "",
             rising: risingSign?.toLowerCase() || ""
           },
-          list: list
+          list
         }
       })
     };
