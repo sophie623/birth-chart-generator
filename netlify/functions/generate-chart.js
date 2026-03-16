@@ -275,7 +275,8 @@ exports.handler = async (event) => {
 
     // Kit should never break the chart
     const subscriberId = await createKitSubscriber(email, firstName);
-
+// add FREE_CHART_USER tag
+await tagKitSubscriber(subscriberId, 17547654);
     try {
       const tagMap = JSON.parse(process.env.KIT_TAG_MAP_JSON || "{}");
 
