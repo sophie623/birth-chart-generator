@@ -223,7 +223,7 @@ const node = getPlanet("node");
 const chiron = getPlanet("chiron");
 const ascendant = getPlanet("ascendant");
 
-    const rising=asc?.sign || degreeToSign(horoscope.ascendant);
+    const rising=ascendant?.sign || degreeToSign(horoscope.ascendant);
 
     let southNode=null;
 
