@@ -298,7 +298,7 @@ const ascendant = getPlanet("ascendant");
           big3:{
             sun:sun?.sign?.toLowerCase(),
             moon:moon?.sign?.toLowerCase(),
-            rising:rising?.toLowerCase()
+            rising: risingSign?.toLowerCase()
           },
           list:list
         }
