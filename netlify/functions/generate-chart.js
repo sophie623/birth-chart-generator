@@ -71,13 +71,16 @@ async function forwardGeocode(birthplace) {
  * - Either provide ASTROAPI_USER_ID + ASTROAPI_KEY
  * - Or provide ASTROAPI_KEY as "USERID:APIKEY"
  */
-function getAstroAuth() {
-  const userId = process.env.ASTROAPI_USER_ID || "";
-  const apiKey = process.env.ASTROAPI_KEY || "";
+function getAstroAuthHeader(){
 
-  if (userId && apiKey && !apiKey.includes(":")) {
-    const auth = Buffer.from(`${userId}:${apiKey}`).toString("base64");
-    return `Basic ${auth}`;
+  const userId=process.env.ASTROLOGY_API_USER_ID;
+  const apiKey=process.env.ASTROLOGY_API_KEY;
+
+  const auth = Buffer.from(`${userId}:${apiKey}`).toString("base64");
+
+  return `Basic ${auth}`;
+
+}
   if (!res.ok) {
     throw new Error(`Geocode failed (${res.status})`);
 }
