@@ -182,11 +182,24 @@ exports.handler = async(event)=>{
       return {statusCode:204,headers:corsHeaders,body:""};
     }
 
-    const {firstName,email,dob,tob,birthplace}
-      =JSON.parse(event.body||"{}");
+    const body = JSON.parse(event.body || "{}");
 
-    const [year,month,day]=dob.split("-").map(Number);
-    const [hour,min]=tob.split(":").map(Number);
+const firstName = body.firstName;
+const email = body.email;
+const dob = body.dob;
+const tob = body.tob;
+const birthplace = body.birthplace;
+
+if (!email || !dob || !tob || !birthplace) {
+  return {
+    statusCode: 400,
+    headers: corsHeaders,
+    body: JSON.stringify({ error: "Missing required fields" }),
+  };
+}
+
+const [year, month, day] = String(dob).split("-").map(Number);
+const [hour, min] = String(tob).split(":").map(Number);
 
     const {lat,lon}=await forwardGeocode(birthplace);
 
